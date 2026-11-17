@@ -131,11 +131,11 @@ def crawl_district(
 
             consecutive_errors = 0
             page_records = parse_company_rows(response.text, letter)
+            if page_callback:
+                page_callback(letter, page_num, page_records, len(records) + len(page_records))
             if not page_records:
                 break
             records.extend(page_records)
-            if page_callback:
-                page_callback(letter, page_num, page_records, len(records))
 
         if progress_callback:
             progress_callback((letter_index + 1) / len(string.ascii_uppercase), letter)
@@ -228,12 +228,22 @@ def main():
     live_preview = st.empty()
     letter_counts = {letter: 0 for letter in string.ascii_uppercase}
     live_records = []
+    st.subheader("Live extraction")
+    live_count.metric("Companies found so far", 0)
+    live_summary.info("Per-letter counts will appear here as pages are checked.")
+    live_preview.info("Waiting for the first directory page to be checked.")
 
     def update_progress(progress, letter):
         progress_bar.progress(progress)
         status_text.text(f"Finished letter [{letter}].")
 
     def update_page(letter, page_num, page_records, total_count):
+        if not page_records:
+            status_text.text(
+                f"Checked [{letter}] page {page_num}; no company entries were detected."
+            )
+            return
+
         live_records.extend(page_records)
         letter_counts[letter] += len(page_records)
         status_text.text(
@@ -291,7 +301,16 @@ def main():
 
     df_result = pd.DataFrame(all_records)
     if df_result.empty:
-        st.error("No records were found. Check the district slug or try again later.")
+        st.error("No company entries were extracted from the directory pages.")
+        if not errors:
+            st.warning(
+                "The pages responded, but no company listings were detected. "
+                "The site may be serving an empty page to the cloud app, or its "
+                "page format may have changed."
+            )
+            st.markdown(
+                f"[Open the source directory page for A]({BASE_URL}/{district_slug}/A)"
+            )
         return
 
     df_result = df_result.drop_duplicates().reset_index(drop=True)

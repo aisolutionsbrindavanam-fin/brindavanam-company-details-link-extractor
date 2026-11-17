@@ -53,12 +53,16 @@ results may be incomplete if some pages fail.
 
 ### Deploy to Render
 
-The included `render.yaml` configures a free Render web service. To publish it:
+The included `render.yaml` configures a free Python web service. To publish it:
 
 1. Push this project to a GitHub repository.
 2. In Render, choose **New → Blueprint**, connect the repository, and deploy
    the `company-pin-extractor` service.
 3. Share the generated `https://...onrender.com` URL with employees.
+
+If creating a Render web service manually with the **Docker** environment,
+keep the included root-level `Dockerfile` in the repository. Render's Docker
+build fails if that file is missing.
 
 The app currently has no sign-in, so anyone who gets the URL can use it. Free
 Render services may sleep when idle and take longer to open on the first visit.
