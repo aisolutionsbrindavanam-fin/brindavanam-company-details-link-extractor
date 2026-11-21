@@ -1,9 +1,19 @@
 import hashlib
+import ipaddress
 import re
+import socket
+import ssl
 import string
 import time
 from io import BytesIO
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import (
+    parse_qs,
+    parse_qsl,
+    urlencode,
+    urljoin,
+    urlparse,
+    urlunparse,
+)
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import pandas as pd
@@ -11,6 +21,7 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
+from urllib3 import HTTPSConnectionPool
 from urllib3.util.retry import Retry
 
 
@@ -58,6 +69,16 @@ EXCLUDED_COMPANY_KEYWORDS = (
 )
 REQUEST_DELAY_SECONDS = 2
 REQUEST_TIMEOUT_SECONDS = 30
+GENERIC_REQUEST_TIMEOUT_SECONDS = 15
+GENERIC_MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+GENERIC_MAX_REDIRECTS = 3
+GENERIC_PAGE_PARAMETERS = ("page", "pageno", "page_num", "page-number", "pg", "p")
+GENERIC_PAGINATION_MODES = {
+    "auto": "Auto-detect",
+    "numbered": "Numbered pages",
+    "alphabet": "A-Z route pages",
+    "next": "Follow Next links",
+}
 
 
 def normalize_company_name(name):
@@ -126,6 +147,454 @@ def aepc_page_url(start_url, page_num):
     query = parse_qs(parsed_url.query, keep_blank_values=True)
     query["pageno"] = [str(page_num)]
     return urlunparse(parsed_url._replace(query=urlencode(query, doseq=True)))
+
+
+def resolve_public_ipv4(hostname):
+    try:
+        addresses = {
+            result[4][0]
+            for result in socket.getaddrinfo(
+                hostname,
+                443,
+                family=socket.AF_INET,
+                type=socket.SOCK_STREAM,
+            )
+        }
+    except socket.gaierror as error:
+        raise ValueError("The directory host could not be resolved.") from error
+
+    if not addresses:
+        raise ValueError("The directory host has no public IPv4 address.")
+
+    for address in addresses:
+        if not ipaddress.ip_address(address).is_global:
+            raise ValueError("Only public website hosts can be fetched.")
+    return sorted(addresses)[0]
+
+
+def validate_generic_url(value):
+    parsed_url = urlparse(value.strip())
+    try:
+        port = parsed_url.port
+    except ValueError as error:
+        raise ValueError("Enter a valid HTTPS directory URL.") from error
+
+    if (
+        parsed_url.scheme.lower() != "https"
+        or not parsed_url.hostname
+        or parsed_url.username is not None
+        or parsed_url.password is not None
+        or port not in (None, 443)
+    ):
+        raise ValueError(
+            "Enter a public HTTPS URL without login details or a custom port."
+        )
+
+    try:
+        hostname = parsed_url.hostname.encode("idna").decode("ascii").lower().rstrip(".")
+    except UnicodeError as error:
+        raise ValueError("Enter a valid website hostname.") from error
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("Enter a website hostname, not an IP address.")
+
+    if not hostname or "." not in hostname:
+        raise ValueError("Enter a fully qualified public website hostname.")
+
+    public_ip = resolve_public_ipv4(hostname)
+    normalized_netloc = hostname
+    normalized_url = urlunparse(
+        parsed_url._replace(
+            scheme="https",
+            netloc=normalized_netloc,
+            fragment="",
+        )
+    )
+    return normalized_url, hostname, public_ip
+
+
+class PinnedHTTPSAdapter(HTTPAdapter):
+    def __init__(self, hostname, public_ip):
+        self.hostname = hostname
+        self.public_ip = public_ip
+        self._pinned_pool = None
+        super().__init__(max_retries=0)
+
+    def _connection_pool(self):
+        if self._pinned_pool is None:
+            self._pinned_pool = HTTPSConnectionPool(
+                host=self.public_ip,
+                port=443,
+                assert_hostname=self.hostname,
+                server_hostname=self.hostname,
+                cert_reqs=ssl.CERT_REQUIRED,
+            )
+        return self._pinned_pool
+
+    def get_connection(self, url, proxies=None):
+        if proxies and any(proxies.values()):
+            raise requests.exceptions.ProxyError(
+                "Proxies are disabled for custom directory URLs."
+            )
+        return self._connection_pool()
+
+    def get_connection_with_tls_context(self, request, verify, proxies=None, cert=None):
+        if proxies and any(proxies.values()):
+            raise requests.exceptions.ProxyError(
+                "Proxies are disabled for custom directory URLs."
+            )
+        return self.get_connection(request.url, proxies)
+
+    def send(self, request, **kwargs):
+        parsed_url = urlparse(request.url)
+        if (
+            parsed_url.scheme.lower() != "https"
+            or parsed_url.hostname != self.hostname
+            or parsed_url.port not in (None, 443)
+        ):
+            raise requests.exceptions.InvalidURL(
+                "Custom crawling is limited to the submitted HTTPS host."
+            )
+        request.headers["Host"] = self.hostname
+        return super().send(request, **kwargs)
+
+    def close(self):
+        if self._pinned_pool is not None:
+            self._pinned_pool.close()
+        super().close()
+
+
+def detect_generic_pagination(start_url):
+    parsed_url = urlparse(start_url)
+    query = parse_qs(parsed_url.query, keep_blank_values=True)
+    for parameter in GENERIC_PAGE_PARAMETERS:
+        values = query.get(parameter, [])
+        if len(values) == 1 and values[0].isdigit():
+            return "numbered", parameter
+
+    last_path_part = parsed_url.path.rstrip("/").rsplit("/", 1)[-1]
+    if re.fullmatch(r"[A-Za-z]", last_path_part):
+        return "alphabet", None
+    return "next", None
+
+
+def numbered_page_url(start_url, page_num, page_parameter):
+    parsed_url = urlparse(start_url)
+    query = parse_qsl(parsed_url.query, keep_blank_values=True)
+    query = [(key, value) for key, value in query if key != page_parameter]
+    query.append((page_parameter, str(page_num)))
+    return urlunparse(parsed_url._replace(query=urlencode(query)))
+
+
+def alphabet_page_url(start_url, letter):
+    parsed_url = urlparse(start_url)
+    path = parsed_url.path.rstrip("/")
+    if not re.search(r"/[A-Za-z]$", path):
+        raise ValueError(
+            "For A-Z pagination, use a directory URL ending in a single letter, "
+            "such as /A."
+        )
+    path = f"{path[:-1]}{letter}"
+    return urlunparse(parsed_url._replace(path=path))
+
+
+def find_next_page_url(html, current_url):
+    soup = BeautifulSoup(html, "html.parser")
+    next_link = soup.find("a", rel=lambda value: value and "next" in value)
+    if next_link is None:
+        for link in soup.find_all("a", href=True):
+            label = " ".join(
+                (
+                    link.get_text(" ", strip=True),
+                    link.get("aria-label", ""),
+                    " ".join(link.get("class", [])),
+                )
+            ).casefold()
+            if re.search(r"\bnext\b|»|›", label):
+                next_link = link
+                break
+
+    if next_link is None:
+        return None
+
+    target_url = urljoin(current_url, next_link.get("href", ""))
+    current_host = urlparse(current_url).hostname
+    target = urlparse(target_url)
+    if (
+        target.scheme.lower() != "https"
+        or target.hostname != current_host
+        or target.username is not None
+        or target.password is not None
+        or target.port not in (None, 443)
+    ):
+        return None
+    return target_url
+
+
+def _is_generic_company_name(value):
+    name = " ".join(value.split()).strip(" -:|,")
+    normalized = normalize_company_name(name)
+    if (
+        not name
+        or len(name) < 2
+        or len(name) > 120
+        or not any(character.isalpha() for character in name)
+        or re.fullmatch(r"\d+", normalized)
+    ):
+        return False
+
+    non_company_labels = {
+        "company",
+        "company name",
+        "business name",
+        "name",
+        "next",
+        "previous",
+        "view details",
+        "read more",
+        "more details",
+        "contact us",
+        "home",
+    }
+    return normalized not in non_company_labels
+
+
+def _company_name_from_container(container):
+    for element in container.select(
+        '[itemprop="name"], [class*="company-name"], [class*="company_name"], '
+        '[class*="business-name"], [class*="firm-name"], [class*="market_title"]'
+    ):
+        name = element.get_text(" ", strip=True)
+        if _is_generic_company_name(name):
+            return name
+
+    for element in container.find_all(["h1", "h2", "h3", "h4", "strong"]):
+        name = element.get_text(" ", strip=True)
+        if _is_generic_company_name(name):
+            return name
+
+    if container.name == "tr":
+        for cell in container.find_all(["td", "th"], recursive=False):
+            name = cell.get_text(" ", strip=True)
+            if _is_generic_company_name(name) and not PINCODE_PATTERN.search(name):
+                return name
+
+    for link in container.find_all("a", href=True):
+        name = link.get_text(" ", strip=True)
+        if _is_generic_company_name(name):
+            return name
+
+    return None
+
+
+def parse_generic_page(html, page_number, source_url):
+    soup = BeautifulSoup(html, "html.parser")
+    records = []
+    containers = list(soup.find_all("tr"))
+    containers.extend(
+        soup.find_all(
+            ["article", "section", "li", "div"],
+            class_=re.compile(
+                r"company|business|firm|member|listing|result|card|views-row",
+                re.I,
+            ),
+        )
+    )
+    containers.extend(soup.find_all(["article", "li"]))
+
+    for container in containers:
+        text = container.get_text(" ", strip=True)
+        pincodes = list(dict.fromkeys(PINCODE_PATTERN.findall(text)))
+        if len(pincodes) != 1:
+            continue
+
+        company_name = _company_name_from_container(container)
+        if not company_name:
+            continue
+
+        first_letter = next(
+            (character.upper() for character in company_name if character.isalpha()),
+            "0-9",
+        )
+        records.append(
+            {
+                "Company_Name": company_name,
+                "Pincode": pincodes[0],
+                "Alphabet_Index": first_letter,
+                "Page_Number": page_number,
+                "Source_URL": source_url,
+            }
+        )
+
+    unique_records = []
+    seen = set()
+    for record in records:
+        key = (normalize_company_name(record["Company_Name"]), record["Pincode"])
+        if key not in seen:
+            seen.add(key)
+            unique_records.append(record)
+    return unique_records
+
+
+def fetch_generic_page(session, url, expected_hostname):
+    current_url = url
+    for redirect_count in range(GENERIC_MAX_REDIRECTS + 1):
+        parsed_url = urlparse(current_url)
+        if (
+            parsed_url.scheme.lower() != "https"
+            or parsed_url.hostname != expected_hostname
+            or parsed_url.username is not None
+            or parsed_url.password is not None
+            or parsed_url.port not in (None, 443)
+        ):
+            raise ValueError("Pagination must stay on the submitted HTTPS host.")
+
+        response = session.get(
+            current_url,
+            timeout=GENERIC_REQUEST_TIMEOUT_SECONDS,
+            allow_redirects=False,
+            stream=True,
+        )
+        if response.status_code in {301, 302, 303, 307, 308}:
+            location = response.headers.get("Location")
+            response.close()
+            if not location or redirect_count == GENERIC_MAX_REDIRECTS:
+                raise ValueError("The directory redirected too many times.")
+            current_url = urljoin(current_url, location)
+            continue
+
+        try:
+            response.raise_for_status()
+            content_type = response.headers.get("Content-Type", "").casefold()
+            if content_type and not any(
+                media_type in content_type
+                for media_type in ("text/html", "application/xhtml+xml")
+            ):
+                raise ValueError("The directory URL did not return an HTML page.")
+
+            chunks = []
+            size = 0
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                size += len(chunk)
+                if size > GENERIC_MAX_RESPONSE_BYTES:
+                    raise ValueError("A directory page exceeded the 5 MB size limit.")
+                chunks.append(chunk)
+        finally:
+            response.close()
+        return b"".join(chunks).decode("utf-8", errors="replace"), current_url
+
+    raise ValueError("The directory redirected too many times.")
+
+
+def crawl_generic_directory(
+    session,
+    start_url,
+    max_pages,
+    pagination_mode="auto",
+    page_parameter="page",
+    progress_callback=None,
+    page_callback=None,
+):
+    start_url, hostname, public_ip = validate_generic_url(start_url)
+    session.trust_env = False
+    session.mount(f"https://{hostname}", PinnedHTTPSAdapter(hostname, public_ip))
+
+    if pagination_mode == "auto":
+        pagination_mode, detected_parameter = detect_generic_pagination(start_url)
+        if detected_parameter:
+            page_parameter = detected_parameter
+    if pagination_mode not in {"numbered", "alphabet", "next"}:
+        raise ValueError("Choose a supported pagination style.")
+    if not 1 <= max_pages <= 50:
+        raise ValueError("The page limit must be between 1 and 50.")
+
+    if pagination_mode == "numbered":
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,39}", page_parameter):
+            raise ValueError("Enter a valid page-number URL parameter.")
+        values = parse_qs(urlparse(start_url).query).get(page_parameter, [])
+        if len(values) > 1 or (values and not values[0].isdigit()):
+            raise ValueError("The selected page parameter must contain one number.")
+        first_page = int(values[0]) if values else 1
+    elif pagination_mode == "alphabet":
+        alphabet_page_url(start_url, "A")
+        first_page = 1
+        max_pages = min(max_pages, 26)
+    else:
+        first_page = 1
+
+    records = []
+    errors = []
+    seen_company_keys = set()
+    seen_page_fingerprints = set()
+    seen_urls = set()
+    current_url = start_url
+
+    for page_offset in range(max_pages):
+        if pagination_mode == "numbered":
+            page_value = first_page + page_offset
+            url = (
+                start_url
+                if page_offset == 0
+                else numbered_page_url(start_url, page_value, page_parameter)
+            )
+            page_label = page_value
+        elif pagination_mode == "alphabet":
+            letter = string.ascii_uppercase[page_offset]
+            url = alphabet_page_url(start_url, letter)
+            page_label = letter
+        else:
+            url = current_url
+            page_label = page_offset + 1
+
+        if url in seen_urls:
+            break
+        seen_urls.add(url)
+
+        try:
+            html, final_url = fetch_generic_page(session, url, hostname)
+        except (requests.RequestException, ValueError) as error:
+            errors.append(f"Page {page_label}: {error}")
+            break
+
+        fingerprint = hashlib.sha256(html.encode("utf-8")).digest()
+        if fingerprint in seen_page_fingerprints:
+            break
+        seen_page_fingerprints.add(fingerprint)
+
+        page_records = parse_generic_page(html, page_label, final_url)
+        new_source_records = []
+        new_records = []
+        for record in page_records:
+            key = (normalize_company_name(record["Company_Name"]), record["Pincode"])
+            if key in seen_company_keys:
+                continue
+            seen_company_keys.add(key)
+            new_source_records.append(record)
+            if not is_excluded_company(record["Company_Name"]):
+                new_records.append(record)
+
+        records.extend(new_records)
+        if page_callback:
+            page_callback(page_offset + 1, new_records, len(records))
+        if progress_callback:
+            progress_callback((page_offset + 1) / max_pages, page_label)
+        if not new_source_records:
+            break
+
+        if pagination_mode == "next":
+            next_url = find_next_page_url(html, final_url)
+            if next_url is None:
+                break
+            current_url = next_url
+
+        time.sleep(REQUEST_DELAY_SECONDS)
+
+    return records, errors
 
 
 def parse_company_rows(html, letter):
@@ -382,15 +851,22 @@ def main():
     )
     st.title("🏢 Automated Company & PIN Code Scraper Dashboard")
     st.markdown(
-        "Extract company names and Indian PIN codes from supported directory pages. "
-        "Other websites require a site-specific adapter."
+        "Extract company names and Indian PIN codes from supported directories, "
+        "or try a bounded best-effort parser on another directory URL."
     )
 
     source_type = st.radio(
         "Directory source",
-        ("CompanyDetails.in (A–Z)", "AEPC India (numbered pages)"),
+        (
+            "CompanyDetails.in (A–Z)",
+            "AEPC India (numbered pages)",
+            "Other directory URL (best effort)",
+        ),
         horizontal=True,
     )
+    generic_start_url = None
+    generic_pagination_mode = "auto"
+    generic_page_parameter = "page"
     if source_type == "CompanyDetails.in (A–Z)":
         col1, col2 = st.columns([2, 1])
         with col1:
@@ -413,7 +889,7 @@ def main():
         district_slug = district_slug_from_input(district_input)
         aepc_start_url = None
         crawl_button_label = "🚀 Start Scraping A to Z"
-    else:
+    elif source_type == "AEPC India (numbered pages)":
         col1, col2 = st.columns([2, 1])
         with col1:
             aepc_input = st.text_input(
@@ -436,12 +912,47 @@ def main():
         aepc_start_url = aepc_url_from_input(aepc_input)
         district_slug = None
         crawl_button_label = "🚀 Start Scraping Numbered Pages"
+    else:
+        with st.container():
+            generic_start_url = st.text_input(
+                "Directory HTTPS URL",
+                placeholder="https://example.com/companies?page=1",
+                help=(
+                    "Only public HTTPS websites are allowed. The parser is best "
+                    "effort; it cannot extract every site layout."
+                ),
+            ).strip()
+            col1, col2, col3 = st.columns([1, 1, 1])
+            with col1:
+                generic_pagination_mode = st.selectbox(
+                    "Pagination style",
+                    tuple(GENERIC_PAGINATION_MODES),
+                    format_func=lambda mode: GENERIC_PAGINATION_MODES[mode],
+                )
+            with col2:
+                generic_page_parameter = st.text_input(
+                    "Page URL parameter",
+                    value="page",
+                    help="Used for numbered pages, for example ?page=2 or ?pageno=2.",
+                ).strip()
+            with col3:
+                max_pages = st.number_input(
+                    "Maximum pages",
+                    min_value=1,
+                    max_value=50,
+                    value=10,
+                    help="Hard cap for this custom-URL crawl.",
+                )
+        district_slug = None
+        aepc_start_url = None
+        crawl_button_label = "🚀 Try This Directory URL"
 
     st.caption(
         "Pages are fetched one at a time with a delay between successful requests. "
         "Companies matching the excluded finance, government, charity, and other "
-        "business categories are omitted. Only the supported sites are accepted; "
-        "check each directory's terms before use."
+        "business categories are omitted. Custom URLs are limited to public HTTPS "
+        "pages on the same host; CAPTCHA or access controls are not bypassed. "
+        "Check each directory's terms before use."
     )
 
     if not st.button(crawl_button_label, type="primary"):
@@ -451,6 +962,9 @@ def main():
         return
     if source_type == "AEPC India (numbered pages)" and aepc_start_url is None:
         st.error("Enter an HTTPS URL for aepcindia.com/members/ with a valid pageno.")
+        return
+    if source_type == "Other directory URL (best effort)" and not generic_start_url:
+        st.error("Enter the HTTPS URL of a directory page.")
         return
 
     headers = {
@@ -496,8 +1010,10 @@ def main():
         progress_bar.progress(progress)
         if source_type == "CompanyDetails.in (A–Z)":
             status_text.text(f"Finished letter [{letter}].")
-        else:
+        elif source_type == "AEPC India (numbered pages)":
             status_text.text(f"Finished page [{letter}].")
+        else:
+            status_text.text(f"Checked custom directory page [{letter}].")
 
     def update_page(letter, page_num, page_records, total_count):
         if not page_records:
@@ -578,7 +1094,7 @@ def main():
                 update_progress,
                 update_page,
             )
-        else:
+        elif source_type == "AEPC India (numbered pages)":
             all_records, errors = crawl_aepc_directory(
                 session,
                 aepc_start_url,
@@ -586,6 +1102,27 @@ def main():
                 update_progress,
                 update_aepc_page,
             )
+        else:
+            try:
+                all_records, errors = crawl_generic_directory(
+                    session,
+                    generic_start_url,
+                    int(max_pages),
+                    generic_pagination_mode,
+                    generic_page_parameter,
+                    update_progress,
+                    update_aepc_page,
+                )
+            except ValueError as error:
+                st.error(str(error))
+                return
+
+    if source_type == "CompanyDetails.in (A–Z)":
+        export_prefix = district_slug
+    elif source_type == "AEPC India (numbered pages)":
+        export_prefix = "aepc_directory"
+    else:
+        export_prefix = urlparse(generic_start_url).hostname or "directory"
 
     status_text.text("Scraping completed.")
     if errors:
@@ -610,8 +1147,10 @@ def main():
                 st.markdown(
                     f"[Open the source directory page for A]({BASE_URL}/{district_slug}/A)"
                 )
-            else:
+            elif source_type == "AEPC India (numbered pages)":
                 st.markdown(f"[Open the source directory page]({aepc_start_url})")
+            else:
+                st.markdown(f"[Open the source directory page]({generic_start_url})")
         return
 
     df_result = df_result.drop_duplicates().reset_index(drop=True)
@@ -640,21 +1179,21 @@ def main():
         st.download_button(
             "📥 Excel workbook (A–Z sheets)",
             excel_data,
-            f"{district_slug}_companies_pincodes.xlsx",
+            f"{export_prefix}_companies_pincodes.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     with col_dl2:
         st.download_button(
             "📥 Per-letter CSV files (.zip)",
             alphabet_csv_data,
-            f"{district_slug}_companies_by_letter.zip",
+            f"{export_prefix}_companies_by_letter.zip",
             "application/zip",
         )
     with col_dl3:
         st.download_button(
             "📥 All companies as CSV",
             csv_data,
-            f"{district_slug}_companies_pincodes.csv",
+            f"{export_prefix}_companies_pincodes.csv",
             "text/csv",
         )
 

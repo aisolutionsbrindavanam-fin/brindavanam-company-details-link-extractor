@@ -32,13 +32,19 @@ All processing is performed locally on your computer.
 
 ## Company directory dashboard
 
-The optional Streamlit dashboard crawls company listing pages from
-`companydetails.in` for a district slug and exports company names and PIN codes
-to Excel or CSV. It shows a live preview and per-letter counts while crawling.
-The Excel workbook includes an all-companies sheet and separate A–Z sheets; a
-ZIP download contains one CSV for each letter with results. Requests are
-sequential and rate-limited; use the dashboard in accordance with the
-directory's terms.
+The optional Streamlit dashboard supports A–Z listings from `companydetails.in`
+and numeric `pageno` listings from AEPC India. It exports company names and PIN
+codes, shows live results, and filters configured excluded business categories.
+The Excel workbook includes an all-companies sheet and A–Z sheets; the ZIP
+download contains CSVs grouped by company initial. Requests are sequential and
+rate-limited, and duplicate companies/pages are skipped. A best-effort mode also
+accepts other public HTTPS directory URLs and can follow numbered query
+parameters, A–Z path routes, or same-host Next links. It looks for common table
+rows and company cards containing a name and a six-digit PIN; layouts that need
+JavaScript, authentication, or unusual markup may not work. Custom crawls are
+restricted to the same public host, limited to 50 pages and 5 MB per page, and
+do not bypass CAPTCHAs or access controls. Use each directory in accordance
+with its terms.
 
 Run it from this folder:
 
@@ -47,9 +53,21 @@ python -m pip install -r requirements.txt
 python -m streamlit run directory_app.py
 ```
 
-Enter a district slug such as `tamil-nadu-dindigul` and choose the page limit
-before starting the A-to-Z crawl. Request errors are shown in the dashboard;
-results may be incomplete if some pages fail.
+For a reliable one-click launch, double-click `Start Company PIN Dashboard.bat`
+in this folder. It starts the server in a minimized terminal, waits until the
+health check succeeds, and then opens the browser. If the dashboard is already
+running, it just opens the existing server.
+
+VS Code can also start the app automatically when this folder opens using
+`.vscode/tasks.json`. Approve the **Open Company & PIN Dashboard** automatic
+task when prompted. If it does not run, use **Terminal: Manage Automatic Tasks
+in Folder** from the Command Palette and allow them. Closing VS Code stops the
+VS Code-managed server; use the batch launcher if automatic tasks are disabled.
+
+Choose a supported source in the dashboard. For AEPC India, paste a members
+listing URL such as the Tamil Nadu filter and set a maximum number of numeric
+pages to fetch. The URL's `pageno` is used as the starting page. Request errors
+are shown in the dashboard; results may be incomplete if some pages fail.
 
 ### Deploy to Render
 
